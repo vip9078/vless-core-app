@@ -1,0 +1,387 @@
+# ============================================================
+# 探路版工作流：只做环境自检，不编译、不打包
+# 用途：搞清楚 GitHub 免费云电脑到底能不能凑齐 vless-core-app 的编译环境
+# 用法：手动上传到仓库的 .github/workflows/probe.yml，然后在 Actions 页面点运行
+#
+# 英文名词对照（命令、路径、变量名本身是英文，系统命令行只认英文，这里解释一次）：
+#   workflow = 自动化任务流程      job = 一个大任务
+#   step = 任务里的一小步          runner = 云电脑
+#   checkout = 把仓库代码下载到云电脑
+#   artifact = 构建产物（这里只是诊断日志）
+# ============================================================
+
+name: 探路版 - 只做环境自检（不编译）
+
+# 只允许用户手动点按钮触发，不自动运行，不会浪费免费时长
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: 云电脑环境探测
+    # 用 Ubuntu 22.04 云电脑：老工具链是 Linux 程序，Mac 云电脑反而不好装
+    runs-on: ubuntu-22.04
+    # 整件事最多跑 60 分钟，卡住就自动停，不白白烧时间
+    timeout-minutes: 60
+
+    steps:
+      # ----------------------------------------------------------
+      - name: 第 0 步 取出仓库源码
+        uses: actions/checkout@v4
+        with:
+          # 放到一个子目录里，因为 Makefile 默认去「上一级目录」找工具链和 core
+          path: vless-core-app
+
+      # ----------------------------------------------------------
+      - name: 第 1 步 看云电脑本身有什么
+        run: |
+          set +e
+          echo "========== 系统信息 =========="
+          lsb_release -ds 2>/dev/null || head -3 /etc/os-release
+          echo "内核: $(uname -r)"
+          echo "CPU 核数: $(nproc)"
+          echo "内存: $(free -h | awk '/^Mem:/{print $2}')"
+          echo "硬盘剩余: $(df -h . | tail -1)"
+          echo ""
+          echo "========== 关键工具是否自带 =========="
+          for tool_name in git curl make python3 clang gcc cmake ninja autoconf automake libtoolize bison flex xz bzip2 patch pkg-config file; do
+            tool_path=$(command -v "$tool_name" 2>/dev/null)
+            if [ -n "$tool_path" ]; then
+              echo "有  $tool_name -> $tool_path"
+            else
+              echo "缺  $tool_name"
+            fi
+          done
+          echo ""
+          echo "========== 补装编译需要的系统包 =========="
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            clang cmake ninja-build autoconf automake libtool \
+            bison flex patch xz-utils bzip2 lzma-alone \
+            zlib1g-dev libssl-dev libxml2-dev libbz2-dev \
+            liblzma-dev libsqlite3-dev uuid-dev \
+            python3 python3-pip file git curl make \
+            libclang-dev llvm-dev >/dev/null 2>&1
+          echo "系统包安装结束（若上面没报错即成功）"
+          echo ""
+          echo "========== 安装后复查 =========="
+          for tool_name in clang clang++ cmake ninja autoconf libtoolize llvm-config; do
+            tool_path=$(command -v "$tool_name" 2>/dev/null)
+            echo "$tool_name -> ${tool_path:-缺}"
+          done
+
+      # ----------------------------------------------------------
+      - name: 第 2 步 探测三套 SDK 能否下载
+        id: sdk
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p toolchains/sdks toolchains/ios6/SDK
+
+          echo "========== 下载 iOS 10.3 和 11.4 软件开发包 =========="
+          # theos/sdks 仓库里有这两套，用「稀疏检出」只取需要的两目录，省流量
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/theos/sdks.git /tmp/theos-sdks 2>&1 | tail -3
+          if [ -d /tmp/theos-sdks ]; then
+            cd /tmp/theos-sdks
+            git sparse-checkout set iPhoneOS10.3.sdk iPhoneOS11.4.sdk
+            for pkg_name in iPhoneOS10.3.sdk iPhoneOS11.4.sdk; do
+              if [ -d "$pkg_name" ]; then
+                cp -a "$pkg_name" "$GITHUB_WORKSPACE/toolchains/sdks/"
+                echo "拿到 $pkg_name，大小: $(du -sh "$GITHUB_WORKSPACE/toolchains/sdks/$pkg_name" | cut -f1)"
+              else
+                echo "没拿到 $pkg_name"
+              fi
+            done
+          fi
+
+          echo ""
+          echo "========== 下载 iOS 6.1 软件开发包 =========="
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/EachAndOther/Legacy-iOS-SDKs.git /tmp/legacy-sdks 2>&1 | tail -3
+          if [ -d /tmp/legacy-sdks ]; then
+            cd /tmp/legacy-sdks
+            git sparse-checkout set iPhoneOS6.1.sdk
+            if [ -d iPhoneOS6.1.sdk ]; then
+              cp -a iPhoneOS6.1.sdk "$GITHUB_WORKSPACE/toolchains/ios6/SDK/"
+              echo "拿到 iPhoneOS6.1.sdk，大小: $(du -sh "$GITHUB_WORKSPACE/toolchains/ios6/SDK/iPhoneOS6.1.sdk" | cut -f1)"
+              echo "关键系统库:"
+              find "$GITHUB_WORKSPACE/toolchains/ios6/SDK/iPhoneOS6.1.sdk" \
+                \( -name 'libSystem.dylib' -o -name 'libSystem.tbd' \) -print | head -3
+            else
+              echo "没拿到 iPhoneOS6.1.sdk"
+            fi
+          fi
+
+          echo ""
+          echo "========== SDK 目录核对 =========="
+          for pkg_name in \
+            "$GITHUB_WORKSPACE/toolchains/ios6/SDK/iPhoneOS6.1.sdk" \
+            "$GITHUB_WORKSPACE/toolchains/sdks/iPhoneOS10.3.sdk" \
+            "$GITHUB_WORKSPACE/toolchains/sdks/iPhoneOS11.4.sdk"; do
+            if [ -d "$pkg_name" ]; then echo "有  $pkg_name"; else echo "缺  $pkg_name"; fi
+          done
+
+      # ----------------------------------------------------------
+      - name: 第 3 步 探测两个核心二进制能否下载
+        id: core
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p "$GITHUB_WORKSPACE/vless-core-cli"
+          cd "$GITHUB_WORKSPACE/vless-core-cli"
+          echo "========== 下载 32 位和 64 位核心程序 =========="
+          # release = 软件发布包；这里下的是别人已经编译好的核心程序
+          base_url="https://github.com/notfence/vless-core-cli/releases/download/v2.0.2"
+          for pkg_name in vless-core-darwin-armv7 vless-core-darwin-arm64; do
+            echo "下载 $pkg_name ..."
+            curl -fsSL --retry 2 --max-time 180 \
+              "$base_url/$pkg_name.tar.gz" -o "/tmp/$pkg_name.tar.gz"
+            if [ $? -eq 0 ]; then
+              tar -xzf "/tmp/$pkg_name.tar.gz"
+              echo "  解压完成，文件大小: $(ls -lh "$pkg_name" 2>/dev/null | awk '{print $5}')"
+            else
+              echo "  下载失败"
+            fi
+          done
+          echo ""
+          echo "========== 核心程序核对 =========="
+          for pkg_name in vless-core-darwin-armv7 vless-core-darwin-arm64; do
+            if [ -f "$pkg_name" ]; then
+              echo "有  $pkg_name  $(file -b "$pkg_name" | cut -c1-100)"
+            else
+              echo "缺  $pkg_name"
+            fi
+          done
+          echo ""
+          echo "注：curl 小程序、OpenSSL 加密库、证书包不在这个发布包里，"
+          echo "    第五步会单独列出来，看看到底还差哪些。"
+
+      # ----------------------------------------------------------
+      - name: 第 4 步 尝试搭建 iOS 老编译器（这一步最可能卡住）
+        id: toolchain
+        continue-on-error: true
+        timeout-minutes: 25
+        run: |
+          set +e
+          echo "========== 先下载工具链生成脚本 =========="
+          git clone --depth 1 \
+            https://github.com/tpoechtrager/cctools-port.git /tmp/cctools-port 2>&1 | tail -3
+          if [ ! -f /tmp/cctools-port/usage_examples/ios_toolchain/build.sh ]; then
+            echo "工具链脚本没拿到，跳过这步"
+            exit 0
+          fi
+
+          echo ""
+          echo "========== 把 iOS 6.1 软件开发包打包成脚本要的格式 =========="
+          # 脚本要求压缩包文件名里带版本号，所以必须叫 iPhoneOS6.1.sdk.tar.gz
+          cd "$GITHUB_WORKSPACE/toolchains/ios6/SDK" || exit 0
+          tar -czf "$GITHUB_WORKSPACE/iPhoneOS6.1.sdk.tar.gz" iPhoneOS6.1.sdk
+          echo "打包完成: $(ls -lh "$GITHUB_WORKSPACE/iPhoneOS6.1.sdk.tar.gz" | awk '{print $5}')"
+
+          echo ""
+          echo "========== 开始生成工具链（最多 25 分钟） =========="
+          cd /tmp/cctools-port/usage_examples/ios_toolchain
+          JOBS=2 ./build.sh "$GITHUB_WORKSPACE/iPhoneOS6.1.sdk.tar.gz" armv7 2>&1 | tail -80
+          build_result=${PIPESTATUS[0]}
+          echo ""
+          echo "工具链脚本退出码: $build_result"
+
+          echo ""
+          echo "========== 生成出来的工具核对 =========="
+          for tool_name in \
+            arm-apple-darwin11-clang arm-apple-darwin11-clang++ \
+            arm-apple-darwin11-ar arm-apple-darwin11-ranlib \
+            arm-apple-darwin11-strip arm-apple-darwin11-otool \
+            arm-apple-darwin11-lipo ldid; do
+            tool_path="/tmp/cctools-port/usage_examples/ios_toolchain/target/bin/$tool_name"
+            if [ -x "$tool_path" ]; then echo "有  $tool_name"; else echo "缺  $tool_name"; fi
+          done
+
+          if [ "$build_result" -eq 0 ]; then
+            echo ""
+            echo "========== 顺手复制到项目要用的位置 =========="
+            mkdir -p "$GITHUB_WORKSPACE/toolchains/ios6/bin"
+            cp -a /tmp/cctools-port/usage_examples/ios_toolchain/target/bin/* \
+                  "$GITHUB_WORKSPACE/toolchains/ios6/bin/" 2>/dev/null
+            cp -a /tmp/cctools-port/usage_examples/ios_toolchain/target/SDK/. \
+                  "$GITHUB_WORKSPACE/toolchains/ios6/SDK/" 2>/dev/null
+            echo "复制完成"
+          fi
+
+      # ----------------------------------------------------------
+      - name: 第 5 步 逐项对照项目自己的自检清单
+        id: items
+        run: |
+          set +e
+          # 这里生成一个检查脚本，把 Makefile 要求的每一项都单独看一遍
+          cat > /tmp/check_items.sh <<'脚本结束'
+          #!/usr/bin/env bash
+          set +e
+          WORKSPACE="$1"
+          PROJECT="$WORKSPACE/vless-core-app"
+          TOOLBIN="$WORKSPACE/toolchains/ios6/bin"
+          CORE_DIR="$WORKSPACE/vless-core-cli"
+          ok_count=0
+          missing_count=0
+
+          check_file() {
+            label="$1"; target_path="$2"
+            if [ -f "$target_path" ]; then
+              printf "有 | %-28s | %s\n" "$label" "$target_path"
+              ok_count=$((ok_count+1))
+            else
+              printf "缺 | %-28s | %s\n" "$label" "$target_path"
+              missing_count=$((missing_count+1))
+            fi
+          }
+          check_exec() {
+            label="$1"; target_path="$2"
+            if [ -x "$target_path" ]; then
+              printf "有 | %-28s | %s\n" "$label" "$target_path"
+              ok_count=$((ok_count+1))
+            else
+              printf "缺 | %-28s | %s\n" "$label" "$target_path"
+              missing_count=$((missing_count+1))
+            fi
+          }
+          check_dir() {
+            label="$1"; target_path="$2"
+            if [ -d "$target_path" ]; then
+              printf "有 | %-28s | %s\n" "$label" "$target_path"
+              ok_count=$((ok_count+1))
+            else
+              printf "缺 | %-28s | %s\n" "$label" "$target_path"
+              missing_count=$((missing_count+1))
+            fi
+          }
+
+          echo "========== A 编译器六件套 =========="
+          check_exec "编译器 clang"        "$TOOLBIN/arm-apple-darwin11-clang"
+          check_exec "打包器 ar"           "$TOOLBIN/arm-apple-darwin11-ar"
+          check_exec "索引器 ranlib"       "$TOOLBIN/arm-apple-darwin11-ranlib"
+          check_exec "剥离器 strip"        "$TOOLBIN/arm-apple-darwin11-strip"
+          check_exec "查看器 otool"        "$TOOLBIN/arm-apple-darwin11-otool"
+          check_exec "合并器 lipo"         "$TOOLBIN/arm-apple-darwin11-lipo"
+
+          echo ""
+          echo "========== B 三套软件开发包 =========="
+          check_dir "iOS 6.1 软件开发包"   "$WORKSPACE/toolchains/ios6/SDK/iPhoneOS6.1.sdk"
+          check_dir "iOS 10.3 软件开发包"  "$WORKSPACE/toolchains/sdks/iPhoneOS10.3.sdk"
+          check_dir "iOS 11.4 软件开发包"  "$WORKSPACE/toolchains/sdks/iPhoneOS11.4.sdk"
+
+          echo ""
+          echo "========== C 签名工具 =========="
+          check_exec "老签名工具 ldid"      "$TOOLBIN/ldid"
+          check_exec "新签名工具 Procursus" "$TOOLBIN/ldid-procursus"
+          if [ -x "$TOOLBIN/ldid-procursus" ]; then
+            echo "  新签名工具版本信息: $("$TOOLBIN/ldid-procursus" -v 2>&1 | head -1)"
+          fi
+
+          echo ""
+          echo "========== D Blocks 运行库 =========="
+          blocks_lib=$(find "$WORKSPACE/toolchains/ios6" -maxdepth 5 -type f -name 'libBlocksRuntime.so' -print -quit 2>/dev/null)
+          if [ -n "$blocks_lib" ]; then
+            printf "有 | %-28s | %s\n" "Blocks 运行库" "$blocks_lib"; ok_count=$((ok_count+1))
+          else
+            printf "缺 | %-28s | %s\n" "Blocks 运行库" "工具链目录下没找到 libBlocksRuntime.so"; missing_count=$((missing_count+1))
+          fi
+
+          echo ""
+          echo "========== E 加密库 OpenSSL（32 位） =========="
+          check_file "32位 头文件 evp.h"    "$CORE_DIR/third_party/openssl-ios6-armv7/include/openssl/evp.h"
+          check_file "32位 libssl.a"        "$CORE_DIR/third_party/openssl-ios6-armv7/lib/libssl.a"
+          check_file "32位 libcrypto.a"     "$CORE_DIR/third_party/openssl-ios6-armv7/lib/libcrypto.a"
+
+          echo ""
+          echo "========== F 加密库 OpenSSL（64 位） =========="
+          check_file "64位 头文件 evp.h"    "$CORE_DIR/third_party/openssl-ios-arm64/include/openssl/evp.h"
+          check_file "64位 libssl.a"        "$CORE_DIR/third_party/openssl-ios-arm64/lib/libssl.a"
+          check_file "64位 libcrypto.a"     "$CORE_DIR/third_party/openssl-ios-arm64/lib/libcrypto.a"
+
+          echo ""
+          echo "========== G 核心程序 =========="
+          check_file "32位核心程序"         "$CORE_DIR/vless-core-darwin-armv7"
+          check_file "64位核心程序"         "$CORE_DIR/vless-core-darwin-arm64"
+
+          echo ""
+          echo "========== H 替换版 curl 小程序 =========="
+          check_file "32位 curl"            "$CORE_DIR/third_party/curl-ios6-armv7/bin/curl"
+          check_file "64位 curl"            "$CORE_DIR/third_party/curl-ios-arm64/bin/curl"
+
+          echo ""
+          echo "========== I 转发小程序 redsocks（仓库自带） =========="
+          check_file "32位 redsocks"        "$PROJECT/third_party/redsocks-vless-core"
+          check_file "64位 redsocks"        "$PROJECT/third_party/redsocks-vless-core-arm64"
+
+          echo ""
+          echo "========== J 证书与杂项 =========="
+          check_file "证书包 cacert.pem"    "$CORE_DIR/third_party/cacert.pem"
+          check_file "32位补丁状态文件"     "$CORE_DIR/third_party/openssl-ios6-armv7/VLESS_OPENSSL_PATCH_STATUS"
+          check_file "64位补丁状态文件"     "$CORE_DIR/third_party/openssl-ios-arm64/VLESS_OPENSSL_PATCH_STATUS"
+          check_file "项目许可证"           "$PROJECT/LICENSE"
+          check_file "第三方许可证"         "$PROJECT/legal/THIRD_PARTY_LICENSES.txt"
+          check_file "扫码库声明"           "$PROJECT/third_party/zbar/COPYING"
+          check_file "应用权限声明"         "$PROJECT/packaging/app-entitlements.xml"
+          check_file "后台权限声明"         "$PROJECT/packaging/daemon-entitlements.xml"
+
+          echo ""
+          echo "========== 汇总 =========="
+          echo "已具备: $ok_count 项"
+          echo "还缺:   $missing_count 项"
+          if [ "$missing_count" -eq 0 ]; then
+            echo "结论：环境齐全，可以尝试完整编译了"
+          else
+            echo "结论：还缺上面标「缺」的项，完整编译暂时跑不了"
+          fi
+          脚本结束
+          chmod +x /tmp/check_items.sh
+          bash /tmp/check_items.sh "$GITHUB_WORKSPACE" | tee /tmp/probe_result.txt
+
+      # ----------------------------------------------------------
+      - name: 第 6 步 实际跑一次项目自带的自检命令
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/vless-core-app" || exit 0
+          echo "========== make check-ios-toolchain =========="
+          make check-ios-toolchain 2>&1 | head -40
+          echo "退出码: ${PIPESTATUS[0]}"
+          echo ""
+          echo "========== make check-package-inputs =========="
+          make check-package-inputs 2>&1 | head -40
+          echo "退出码: ${PIPESTATUS[0]}"
+          echo ""
+          echo "注：这两条命令只要缺一样东西就会停。"
+          echo "    完整清单请看上一步的逐项结果。"
+
+      # ----------------------------------------------------------
+      - name: 第 7 步 生成看得懂的总结报告
+        run: |
+          set +e
+          {
+            echo "## 探路结果（只看环境，没有编译）"
+            echo ""
+            echo "### 逐项清单"
+            echo '```text'
+            cat /tmp/probe_result.txt 2>/dev/null || echo "没有生成清单"
+            echo '```'
+            echo ""
+            echo "### 怎么看这份报告"
+            echo "- 标「有」的是云电脑已经具备的。"
+            echo "- 标「缺」的是完整编译前必须补上的。"
+            echo "- 第 4 步如果超时或报错，说明老工具链在这台云电脑上搭不起来，这是最关键的信号。"
+            echo ""
+            echo "### 下一步怎么定"
+            echo "- 缺得少：可以先试着补，再写完整编译流程。"
+            echo "- 缺得多（尤其是编译器和加密库）：建议换条路，比如只替换现成安装包里的界面文字。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "总结报告已写入「Summary」标签页，不用翻日志。"
+
+      # ----------------------------------------------------------
+      - name: 第 8 步 保存诊断日志
+        uses: actions/upload-artifact@v4
+        with:
+          name: 探路诊断日志
+          path: |
+            /tmp/probe_result.txt
+          if-no-files-found: warn
